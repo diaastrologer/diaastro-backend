@@ -1,0 +1,20 @@
+# Secrets - NEVER commit these
+.env
+leads.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+.venv/
+
+# Logs
+logs/
+*.log
+diaastro_web.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: diaastro-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false          # you will enter this manually in Render dashboard
+      - key: BUSINESS_NAME
+        value: DiaAstro
+      - key: INSTAGRAM
+        value: "@dia.astrologer"
+      - key: PHONE
+        value: "8625815099"
+      - key: EMAIL
+        value: ruchi.bhardwaj@diaastro.in
+      - key: LEADS_TOKEN
+        sync: false          # you will enter this manually in Render dashboard
+      - key: ALLOWED_ORIGINS
+        sync: false          # you will enter your Netlify URL here after deploy
