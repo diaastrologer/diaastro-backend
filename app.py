@@ -51,11 +51,11 @@ CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
 _leads_store = []
 
 # ── Email helper ──────────────────────────────────────────────────────────────
-def send_lead_email(name, phone, feature, timestamp):
+def send_lead_email(name, phone, feature, timestamp, dob='', tob='', pob=''):
     """Send lead details to Ruchi's email via Gmail SMTP. Runs in background thread."""
-    smtp_user     = os.getenv('SMTP_USER', '')      # your Gmail address
-    smtp_password = os.getenv('SMTP_PASSWORD', '')  # Gmail App Password (16 chars)
-    notify_email  = os.getenv('NOTIFY_EMAIL', smtp_user)  # where to send leads
+    smtp_user     = os.getenv('SMTP_USER', '')
+    smtp_password = os.getenv('SMTP_PASSWORD', '')
+    notify_email  = os.getenv('NOTIFY_EMAIL', smtp_user)
 
     if not smtp_user or not smtp_password:
         logger.warning("Email not configured — SMTP_USER or SMTP_PASSWORD missing.")
@@ -67,10 +67,13 @@ def send_lead_email(name, phone, feature, timestamp):
     body = f"""
 New lead from diaastro.in
 
-Name     : {name}
-Phone    : {phone}
-Feature  : {feature_label}
-Time     : {timestamp}
+Name            : {name}
+Phone           : {phone}
+Feature         : {feature_label}
+Year of Birth   : {dob if dob else 'Not provided'}
+Time of Birth   : {tob if tob else 'Not provided'}
+Place of Birth  : {pob if pob else 'Not provided'}
+Time            : {timestamp}
 
 Reply to this email or WhatsApp them at:
 https://wa.me/91{phone}
@@ -83,13 +86,14 @@ https://wa.me/91{phone}
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
-        with smtplib.SMTP('smtpout.secureserver.net', 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.sendmail(smtp_user, notify_email, msg.as_string())
+        # Always also send to dia.astrologer@gmail.com
+        recipients = list({notify_email, 'dia.astrologer@gmail.com'})
 
-        logger.info(f"Lead email sent for {name} to {notify_email}")
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(smtp_user, smtp_password)
+            server.sendmail(smtp_user, recipients, msg.as_string())
+
+        logger.info(f"Lead email sent for {name} to {recipients}")
     except Exception as e:
         logger.error(f"Failed to send lead email: {e}")
 
@@ -187,35 +191,39 @@ def save_lead():
     Save a visitor lead.
     1. Validates name + phone.
     2. Stores in in-memory list (visible via /leads this session).
-    3. Emails Ruchi instantly in a background thread (no delay to caller).
+    3. Emails instantly in a background thread (no delay to caller).
     """
     data    = request.get_json(silent=True) or {}
     name    = (data.get('name') or '').strip()
     phone   = re.sub(r'\D', '', data.get('phone') or '')
     feature = data.get('feature', 'unknown')
+    dob     = (data.get('dob') or '').strip()
+    tob     = (data.get('tob') or '').strip()
+    pob     = (data.get('pob') or '').strip()
 
     if not name:
         return jsonify({'success': False, 'error': 'Name is required.'}), 400
-    if len(phone) < 10:
+    if len(phone) != 10:
         return jsonify({'success': False, 'error': 'Please enter a valid 10-digit mobile number.'}), 400
 
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # Store in memory
     _leads_store.append({
-        'name': name, 'phone': phone,
-        'feature': feature, 'timestamp': timestamp
+        'name': name, 'phone': phone, 'feature': feature,
+        'dob': dob, 'tob': tob, 'pob': pob,
+        'timestamp': timestamp
     })
 
-    # Email Ruchi in background — caller gets instant response
+    # Email in background — caller gets instant response
     thread = threading.Thread(
         target=send_lead_email,
-        args=(name, phone, feature, timestamp),
+        args=(name, phone, feature, timestamp, dob, tob, pob),
         daemon=True
     )
     thread.start()
 
-    logger.info(f"/save-lead | {name} | {phone} | feature={feature}")
+    logger.info(f"/save-lead | {name} | {phone} | feature={feature} | dob={dob} | tob={tob} | pob={pob}")
     return jsonify({'success': True, 'message': 'Lead saved successfully.'})
 
 
