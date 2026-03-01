@@ -7,17 +7,20 @@ Exposes the DiaAstroAgent over HTTP so the React website can call it.
 Endpoints:
   POST /ask           - AI astrology guidance
   POST /palm-reading  - Palm image analysis
-  POST /save-lead     - Save visitor lead (name + phone)
-  GET  /leads         - View captured leads (protect in production!)
+  POST /save-lead     - Save visitor lead (name + phone) — emails Ruchi instantly
+  GET  /leads         - View in-memory leads for current session
   GET  /health        - Health check
 """
 
 import os
 import re
 import sys
-import json
 import base64
 import logging
+import smtplib
+import threading
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 from flask import Flask, request, jsonify
@@ -27,27 +30,69 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
-    handlers=[
-        logging.FileHandler('logs/diaastro_web.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout),
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-# Allow React dev server (port 3000) and your production domain
 ALLOWED_ORIGINS = os.getenv(
     'ALLOWED_ORIGINS',
     'http://localhost:3000,http://localhost:3001,https://diaastro.in,https://www.diaastro.in'
 ).split(',')
 
 CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
+
+# ── In-memory lead store (survives within a session, cleared on restart) ──────
+_leads_store = []
+
+# ── Email helper ──────────────────────────────────────────────────────────────
+def send_lead_email(name, phone, feature, timestamp):
+    """Send lead details to Ruchi's email via Gmail SMTP. Runs in background thread."""
+    smtp_user     = os.getenv('SMTP_USER', '')      # your Gmail address
+    smtp_password = os.getenv('SMTP_PASSWORD', '')  # Gmail App Password (16 chars)
+    notify_email  = os.getenv('NOTIFY_EMAIL', smtp_user)  # where to send leads
+
+    if not smtp_user or not smtp_password:
+        logger.warning("Email not configured — SMTP_USER or SMTP_PASSWORD missing.")
+        return
+
+    feature_label = 'AI Palm Reading' if feature == 'palm' else 'AI Astrology Guidance'
+
+    subject = f"🌟 New DiaAstro Lead — {name}"
+    body = f"""
+New lead from diaastro.in
+
+Name     : {name}
+Phone    : {phone}
+Feature  : {feature_label}
+Time     : {timestamp}
+
+Reply to this email or WhatsApp them at:
+https://wa.me/91{phone}
+""".strip()
+
+    try:
+        msg = MIMEMultipart()
+        msg['From']    = smtp_user
+        msg['To']      = notify_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        with smtplib.SMTP('smtpout.secureserver.net', 587) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.sendmail(smtp_user, notify_email, msg.as_string())
+
+        logger.info(f"Lead email sent for {name} to {notify_email}")
+    except Exception as e:
+        logger.error(f"Failed to send lead email: {e}")
+
 
 # ── Load Agent ────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -64,7 +109,6 @@ except Exception as e:
 
 # ── Helper ─────────────────────────────────────────────────────────────────────
 def agent_required(fn):
-    """Decorator: return 503 if agent is not available."""
     from functools import wraps
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -83,6 +127,8 @@ def health_check():
         'status': 'healthy' if agent else 'degraded',
         'agent_available': agent is not None,
         'business': agent.config.get('BUSINESS_NAME', 'DiaAstro') if agent else 'Unknown',
+        'email_configured': bool(os.getenv('SMTP_USER') and os.getenv('SMTP_PASSWORD')),
+        'leads_this_session': len(_leads_store),
         'timestamp': datetime.now().isoformat(),
     })
 
@@ -90,7 +136,6 @@ def health_check():
 @app.route('/ask', methods=['POST'])
 @agent_required
 def ask():
-    """Generate AI astrology guidance for a question."""
     data = request.get_json(silent=True) or {}
     question = (data.get('question') or '').strip()
 
@@ -100,26 +145,17 @@ def ask():
         return jsonify({'success': False, 'error': 'Question too long (max 1000 chars).'}), 400
 
     logger.info(f"/ask | question: {question[:80]}...")
-
     response = agent.generate_astrology_insight(question)
 
     if not response:
-        return jsonify({
-            'success': False,
-            'error': 'Unable to generate guidance right now. Please try again in a moment.'
-        }), 500
+        return jsonify({'success': False, 'error': 'Unable to generate guidance right now. Please try again in a moment.'}), 500
 
-    return jsonify({
-        'success': True,
-        'response': response,
-        'timestamp': datetime.now().isoformat(),
-    })
+    return jsonify({'success': True, 'response': response, 'timestamp': datetime.now().isoformat()})
 
 
 @app.route('/palm-reading', methods=['POST'])
 @agent_required
 def palm_reading():
-    """Analyse a palm image and return a reading."""
     if 'image' not in request.files:
         return jsonify({'success': False, 'error': 'No image provided.'}), 400
 
@@ -134,27 +170,26 @@ def palm_reading():
         return jsonify({'success': False, 'error': 'Image too large. Please use an image under 5 MB.'}), 400
 
     image_b64 = base64.b64encode(image_data).decode('utf-8')
-    mime_type = image_file.content_type or 'image/jpeg'
+    mime_type  = image_file.content_type or 'image/jpeg'
 
     logger.info(f"/palm-reading | style={reading_style} | size={len(image_data)} bytes")
-
     reading = agent.generate_palm_reading(image_b64, mime_type, reading_style)
 
     if not reading:
         return jsonify({'success': False, 'error': 'Unable to read the palm. Please try a clearer image.'}), 500
 
-    return jsonify({
-        'success': True,
-        'reading': reading,
-        'style': reading_style,
-        'timestamp': datetime.now().isoformat(),
-    })
+    return jsonify({'success': True, 'reading': reading, 'style': reading_style, 'timestamp': datetime.now().isoformat()})
 
 
 @app.route('/save-lead', methods=['POST'])
 def save_lead():
-    """Save a visitor lead (name + phone) before unlocking AI features."""
-    data = request.get_json(silent=True) or {}
+    """
+    Save a visitor lead.
+    1. Validates name + phone.
+    2. Stores in in-memory list (visible via /leads this session).
+    3. Emails Ruchi instantly in a background thread (no delay to caller).
+    """
+    data    = request.get_json(silent=True) or {}
     name    = (data.get('name') or '').strip()
     phone   = re.sub(r'\D', '', data.get('phone') or '')
     feature = data.get('feature', 'unknown')
@@ -164,26 +199,21 @@ def save_lead():
     if len(phone) < 10:
         return jsonify({'success': False, 'error': 'Please enter a valid 10-digit mobile number.'}), 400
 
-    lead = {
-        'name': name,
-        'phone': phone,
-        'feature': feature,
-        'timestamp': datetime.now().isoformat(),
-        'source': 'website',
-    }
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    leads_file = 'leads.json'
-    leads = []
-    if os.path.exists(leads_file):
-        try:
-            with open(leads_file, 'r', encoding='utf-8') as f:
-                leads = json.load(f)
-        except Exception:
-            leads = []
+    # Store in memory
+    _leads_store.append({
+        'name': name, 'phone': phone,
+        'feature': feature, 'timestamp': timestamp
+    })
 
-    leads.append(lead)
-    with open(leads_file, 'w', encoding='utf-8') as f:
-        json.dump(leads, f, indent=2, ensure_ascii=False)
+    # Email Ruchi in background — caller gets instant response
+    thread = threading.Thread(
+        target=send_lead_email,
+        args=(name, phone, feature, timestamp),
+        daemon=True
+    )
+    thread.start()
 
     logger.info(f"/save-lead | {name} | {phone} | feature={feature}")
     return jsonify({'success': True, 'message': 'Lead saved successfully.'})
@@ -192,19 +222,19 @@ def save_lead():
 @app.route('/leads', methods=['GET'])
 def view_leads():
     """
-    View all captured leads.
-    ⚠️  Protect this endpoint with a password or IP restriction in production!
+    View leads captured since last restart.
+    Protected by LEADS_TOKEN env var.
+    Access: /leads?token=your_secret_token
     """
-    # Basic token check — set LEADS_TOKEN in your .env
     token = os.getenv('LEADS_TOKEN', '')
     if token and request.args.get('token') != token:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    if not os.path.exists('leads.json'):
-        return jsonify({'leads': [], 'total': 0})
-    with open('leads.json', 'r', encoding='utf-8') as f:
-        leads = json.load(f)
-    return jsonify({'leads': leads, 'total': len(leads)})
+    return jsonify({
+        'leads': _leads_store,
+        'total': len(_leads_store),
+        'note': 'In-memory only — leads are also emailed to Ruchi instantly. This list resets on server restart.'
+    })
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -213,13 +243,11 @@ if __name__ == '__main__':
     print(f"\n{'='*45}")
     print("  DiaAstro AI Backend")
     print(f"{'='*45}")
-    print(f"  Agent status : {'READY' if agent else 'NOT READY - check .env'}")
-    if agent:
-        print(f"  Business     : {agent.config.get('BUSINESS_NAME')}")
-        print(f"  Instagram    : {agent.config.get('INSTAGRAM')}")
-    print(f"  Server       : http://localhost:{port}")
-    print(f"  Health check : http://localhost:{port}/health")
-    print(f"  CORS origins : {ALLOWED_ORIGINS}")
+    print(f"  Agent status    : {'READY' if agent else 'NOT READY - check .env'}")
+    print(f"  Email alerts    : {'CONFIGURED' if os.getenv('SMTP_USER') else 'NOT SET - add SMTP_USER & SMTP_PASSWORD'}")
+    print(f"  Server          : http://localhost:{port}")
+    print(f"  Health check    : http://localhost:{port}/health")
+    print(f"  CORS origins    : {ALLOWED_ORIGINS}")
     print(f"{'='*45}\n")
 
     app.run(host='0.0.0.0', port=port, debug=False)
