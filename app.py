@@ -4,7 +4,7 @@ DiaAstro Flask Backend
 ======================
 Exposes the DiaAstroAgent over HTTP so the React website can call it.
 
-Endpoints:
+Endpoints :
   POST /ask           - AI astrology guidance
   POST /palm-reading  - Palm image analysis
   POST /save-lead     - Save visitor lead (name + phone)
